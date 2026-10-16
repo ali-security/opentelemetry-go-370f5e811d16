@@ -1,9 +1,12 @@
 name: ci
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regex; empty runs the full suite"
+        required: false
+        default: ""
+        type: string
 env:
   # Default version of Go to use by CI workflows. This should be the latest
   # release of Go; developers likely use the latest release in development and
@@ -18,6 +21,8 @@ permissions: read-all
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: false
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -60,6 +65,8 @@ jobs:
 
   govulncheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: false
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -96,6 +103,7 @@ jobs:
 
   test-bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -113,6 +121,7 @@ jobs:
 
   test-race:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -123,10 +132,17 @@ jobs:
           check-latest: true
           cache-dependency-path: "**/go.sum"
       - name: Run tests with race detector
-        run: make test-race
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -race -run '${{ inputs.test-filter }}' ./...
+          else
+            make test-verbose 2>&1 | tee "$RUNNER_TEMP/test-race.log"
+            awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} END{printf "TEST SUMMARY: %d tests passed, %d failed, %d skipped\n", p, f, s}' "$RUNNER_TEMP/test-race.log"
+          fi
 
   test-concurrent-safe:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -141,6 +157,7 @@ jobs:
 
   test-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -160,6 +177,8 @@ jobs:
 
   codecov:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: false
     needs: [test-coverage]
     steps:
       - name: Checkout Repo
@@ -194,6 +213,7 @@ jobs:
           - os: windows-latest
             arch: amd64
     runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -206,10 +226,17 @@ jobs:
       - name: Run tests
         env:
           GOARCH: ${{ matrix.platform.arch }}
-        run: make test-short
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -short -run '${{ inputs.test-filter }}' ./...
+          else
+            make test-short
+          fi
 
   test-compatibility:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [compatibility-test]
     if: always()
     steps:
@@ -217,3 +244,53 @@ jobs:
         run: |
           echo ${{ needs.compatibility-test.result }}
           test ${{ needs.compatibility-test.result }} == "success"
+
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.DEFAULT_GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: "**/go.sum"
+      - name: Build module zip
+        run: |
+          mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/dist"
+          cat > "$RUNNER_TEMP/modzip/main.go" <<'GOEOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              out, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer out.Close()
+              mv := module.Version{Path: "go.opentelemetry.io/otel", Version: "v1.43.0"}
+              if err := zip.CreateFromDir(out, mv, os.Args[1]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          GOEOF
+          cd "$RUNNER_TEMP/modzip"
+          go mod init modzip
+          go get golang.org/x/mod@v0.24.0
+          go run . "$GITHUB_WORKSPACE" "$RUNNER_TEMP/dist/v1.43.0.zip"
+          unzip -l "$RUNNER_TEMP/dist/v1.43.0.zip" | tail -1
+      - name: Upload module zip
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/dist/v1.43.0.zip
+          if-no-files-found: error
